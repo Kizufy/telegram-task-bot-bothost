@@ -1,0 +1,7 @@
+.env
+secrets
+data
+.venv
+__pycache__
+*.log
+test_bot.py
