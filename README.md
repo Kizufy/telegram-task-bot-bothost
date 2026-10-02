@@ -2,7 +2,7 @@
 
 Бот читает Google Таблицу «Поручения» и отправляет каждому сотруднику его новые задачи в личный Telegram-чат. В таблице обновляются только поля уведомлений I:K. Сам бот поручения не создаёт.
 
-Таблица: https://docs.google.com/spreadsheets/d/14nJWblceZjiCeihh07J0qs8C6dCUKl_bExIC9RPnEiM/edit
+Таблица: https://docs.google.com/spreadsheets/*******************
 
 ## Что уже реализовано
 
