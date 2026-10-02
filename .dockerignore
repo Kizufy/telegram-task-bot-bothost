@@ -5,3 +5,4 @@ data
 __pycache__
 *.log
 test_bot.py
+test_workflow.py

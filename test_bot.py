@@ -4,6 +4,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from workflow import Workflow
 
 from bot import APIError, Engine, Sheets, Store, TASK_HEADERS, PEOPLE_HEADERS, Telegram, handle_update, message_parts, CompletionFlow, FINISH_BUTTON
 
@@ -32,6 +33,17 @@ class FakeSheets:
         for index, value in self.tasks:
             if index == row:
                 value['Статус задачи'] = 'Выполнена'
+
+    def modify(self, row, expected, changes):
+        if self.fail_write:
+            raise RuntimeError('offline')
+        from datetime import datetime, timedelta
+        self.writes.append(('modify', row, changes))
+        for index, value in self.tasks:
+            if index == row:
+                value.update(changes)
+                if isinstance(value['Дедлайн'], (int, float)):
+                    value['Дедлайн'] = (datetime(1899, 12, 30) + timedelta(days=value['Дедлайн'])).strftime('%d.%m.%Y %H:%M')
 
     def mirror(self, *args):
         if self.fail_write:
@@ -79,6 +91,8 @@ class BotTests(unittest.TestCase):
         self.assertIn(FINISH_BUTTON, str(self.tg.markups[-1]))
         self.menu_update(FINISH_BUTTON, uid=20)
         self.menu_update('1', uid=20)
+        data = Workflow(self.store, self.tg, self.sheets, {10}).dialog(20)
+        self.ui_callback('submit:' + data['nonce'], uid=20)
         notices = [(chat, text) for chat, text in self.tg.messages if chat == 10]
         self.assertIn('Иванов Сергей', notices[0][1])
         self.assertIn('Подготовить договор', notices[0][1])
@@ -95,7 +109,7 @@ class BotTests(unittest.TestCase):
         count = len(self.tg.messages)
         self.callback('return')
         self.completion().cycle()
-        self.assertEqual(len(self.tg.messages), count)
+        self.assertFalse(any('вернул' in text for _, text in self.tg.messages[count:]))
         self.assertEqual(len(self.sheets.writes), 1)
 
     def test_return_notifies_and_allows_new_report_old_buttons_do_not_affect_it(self):
@@ -103,7 +117,9 @@ class BotTests(unittest.TestCase):
         self.completion().report(20, '1')
         old = self.report_id()
         self.callback('return')
-        self.assertIn('не считается выполненной', self.tg.messages[-1][1])
+        self.menu_update('Исправьте реквизиты договора')
+        self.assertTrue(any('не считается выполненной' in text for _, text in self.tg.messages))
+        self.assertTrue(any('Исправьте реквизиты' in text for uid, text in self.tg.messages if uid == 20))
         self.assertEqual(self.sheets.tasks[0][1]['Статус задачи'], 'Новая')
         self.completion().report(20, '1')
         self.assertNotEqual(old, self.report_id())
@@ -154,12 +170,14 @@ class BotTests(unittest.TestCase):
     def test_finish_button_on_notification_resolves_task_and_checks_owner(self):
         self.bind(chat=20)
         self.engine.cycle()
-        button = self.tg.markups[-1]['inline_keyboard'][0][0]
+        button = self.tg.markups[-1]['inline_keyboard'][1][0]
         self.assertIn('№1', button['text'])
         for uid in (99, 20):
             handle_update({'callback_query': {'id': 'finish', 'from': {'id': uid},
                 'message': {'chat': {'id': uid, 'type': 'private'}}, 'data': button['callback_data']}},
                 self.store, self.tg, self.sheets, {10}, 'test_bot')
+        dialog = Workflow(self.store, self.tg, self.sheets, {10}).dialog(20)
+        self.ui_callback('submit:' + dialog['nonce'], uid=20)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM completions').fetchone()[0], 1)
 
     def test_inactive_employee_cannot_report_and_duplicate_task_is_rejected(self):
@@ -199,6 +217,11 @@ class BotTests(unittest.TestCase):
                        'from': {'id': uid}, 'text': text}}, self.store, self.tg,
                       self.sheets, {10}, 'test_bot')
 
+    def ui_callback(self, data, uid=10):
+        handle_update({'callback_query': {'id': 'cb', 'from': {'id': uid},
+            'message': {'chat': {'id': uid, 'type': 'private'}}, 'data': data}},
+            self.store, self.tg, self.sheets, {10}, 'test_bot')
+
     def test_admin_menu_and_sheet_button(self):
         self.menu_update('/start')
         self.assertIn('👥 Сотрудники', str(self.tg.markups[-1]))
@@ -223,7 +246,9 @@ class BotTests(unittest.TestCase):
         self.sheets.people = {f'EMP{i:04}': {'ФИО': '😀' * 50 + str(i), 'Активен': 'Нет'} for i in range(100)}
         self.tg.messages.clear()
         self.menu_update('/employees')
-        self.assertGreater(len(self.tg.messages), 1)
+        self.assertEqual(len(self.tg.messages), 1)
+        self.ui_callback('people:16')
+        self.assertEqual(len(self.tg.messages), 2)
         self.assertTrue(all(len(text.encode('utf-16-le')) // 2 <= 3500 for _, text in self.tg.messages))
         self.assertIn('EMP0099', ''.join(text for _, text in self.tg.messages))
 

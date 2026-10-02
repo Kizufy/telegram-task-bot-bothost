@@ -8,6 +8,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -15,6 +16,10 @@ import urllib.request
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+if __name__ == '__main__':
+    # The Windows direct entrypoint and imported workflows share exception classes.
+    sys.modules['bot'] = sys.modules[__name__]
 
 LOG = logging.getLogger('taskbot')
 MOSCOW = timezone(timedelta(hours=3))
@@ -166,6 +171,29 @@ class Sheets:
         if result != [['Выполнена']]:
             raise RuntimeError('Не удалось подтвердить запись статуса в таблицу')
 
+    def modify(self, row, expected, changes):
+        # Recheck the full task before writing individual cells. Never rewrite a row.
+        address = self.address(self.task_sheet, f'A{row}:H{row}')
+        values = self.request('GET', '/values/' + urllib.parse.quote(address, safe=''),
+                              params={'valueRenderOption': 'FORMATTED_VALUE'}).get('values', [])
+        current = dict(zip(TASK_HEADERS, (values[0] if values else []) + [''] * 8))
+        for column in TASK_HEADERS[:8]:
+            if str(current.get(column, '')).strip() != str(expected.get(column, '')).strip():
+                raise ValueError('Задача изменена или строка перемещена. Откройте карточку заново.')
+        allowed = {'Задача', 'ФИО', 'Дедлайн', 'Статус задачи', 'ID сотрудника'}
+        if not changes or not changes.keys() <= allowed:
+            raise ValueError('Недопустимое изменение задачи')
+        data = [{'range': self.address(self.task_sheet, f'{col(TASK_HEADERS.index(k))}{row}'),
+                 'values': [[v]]} for k, v in changes.items()]
+        self.request('POST', '/values:batchUpdate', json={'valueInputOption': 'RAW', 'data': data})
+        found = self.request('GET', '/values/' + urllib.parse.quote(address, safe=''),
+                            params={'valueRenderOption': 'UNFORMATTED_VALUE'}).get('values', [])
+        raw = dict(zip(TASK_HEADERS, (found[0] if found else []) + [''] * 8))
+        if str(raw.get('Номер задачи', '')).strip() != str(expected['Номер задачи']).strip():
+            raise RuntimeError('Не удалось проверить запись: строка перемещена')
+        if any(raw.get(k) != v for k, v in changes.items()):
+            raise RuntimeError('Не удалось подтвердить запись изменений')
+
 
 class Store:
     def __init__(self, path):
@@ -192,6 +220,13 @@ class Store:
         ''')
         # Crash between durable 'sending' and durable acknowledgement is ambiguous.
         self.db.execute("UPDATE deliveries SET state='uncertain', error='Прервано во время отправки; нужна проверка' WHERE state='sending'")
+        self.db.commit()
+        # Additive migration preserves bindings, delivery history and old reports.
+        columns = {r[1] for r in self.db.execute('PRAGMA table_info(completions)')}
+        for name, definition in [('evidence', "TEXT NOT NULL DEFAULT '[]'"),
+                                 ('reason', "TEXT NOT NULL DEFAULT ''")]:
+            if name not in columns:
+                self.db.execute(f'ALTER TABLE completions ADD COLUMN {name} {definition}')
         self.db.commit()
 
     def invite(self, employee, hours=24):
@@ -301,11 +336,13 @@ FINISH_BUTTON = '✅ Сообщить о завершении задачи'
 
 def task_payload(task):
     return {'employee': str(task['ID сотрудника']).strip(),
-            'name': str(task['ФИО']).strip(), 'text': str(task['Задача']).strip()}
+            'name': str(task['ФИО']).strip(), 'text': str(task['Задача']).strip(),
+            'due': str(task['Дедлайн']).strip()}
 
 
 def same_task(task, key, payload):
     return (str(task.get('Номер задачи', '')).strip() == key and
+            ('due' not in payload or str(task.get('Дедлайн', '')).strip() == payload['due']) and
             all(str(task.get(column, '')).strip() == payload[field]
                 for column, field in [('ID сотрудника', 'employee'), ('ФИО', 'name'), ('Задача', 'text')]))
 
@@ -321,7 +358,7 @@ class CompletionFlow:
     def __init__(self, store, telegram, sheets, admins):
         self.store, self.telegram, self.sheets, self.admins = store, telegram, sheets, admins
 
-    def report(self, uid, key):
+    def report(self, uid, key, evidence=None):
         binding = self.store.db.execute('SELECT employee FROM bindings WHERE chat=?', (uid,)).fetchone()
         if not binding:
             raise ValueError('Сначала подключитесь по приглашению администратора.')
@@ -341,8 +378,9 @@ class CompletionFlow:
         if existing:
             return 'Отчёт по этой задаче уже ожидает решения администратора.'
         with self.store.db:
-            self.store.db.execute('INSERT INTO completions(id,task,employee,chat,payload) VALUES(?,?,?,?,?)',
-                (secrets.token_hex(12), key, binding[0], uid, json.dumps(payload, ensure_ascii=False)))
+            self.store.db.execute('INSERT INTO completions(id,task,employee,chat,payload,evidence) VALUES(?,?,?,?,?,?)',
+                (secrets.token_hex(12), key, binding[0], uid, json.dumps(payload, ensure_ascii=False),
+                 json.dumps(evidence or [], ensure_ascii=False)))
         self.cycle()
         return f'Отчёт по задаче №{key} сохранён и поставлен на отправку администратору.'
 
@@ -360,23 +398,38 @@ class CompletionFlow:
             except Exception:
                 LOG.warning('Завершение задачи не синхронизировано; повтор позже')
 
-    def notify_admins(self, record):
+    def notify_admins(self, record, remember=True):
         payload = json.loads(record['payload'])
         parts = text_parts(f"Сотрудник {payload['name']} сообщил о выполнении задачи №{record['task']}.\n\nЗадача: {payload['text']}")
         notices = json.loads(record['notices'])
+        evidence = json.loads(record['evidence'])
         markup = {'inline_keyboard': [
             [{'text': '✅ Подтвердить выполнение задачи', 'callback_data': 'approve:' + record['id']}],
             [{'text': '↩️ Вернуть задачу', 'callback_data': 'return:' + record['id']}]]}
         for admin in sorted(self.admins):
             progress = notices.get(str(admin), 0)
-            for i in range(progress, len(parts)):
-                self.telegram.send(admin, parts[i], reply_markup=markup if i == len(parts) - 1 else None)
+            total = len(parts) + len(evidence) + (1 if evidence else 0)
+            for i in range(progress, total):
+                if i < len(parts):
+                    self.telegram.send(admin, parts[i], reply_markup=markup if not evidence and i == len(parts) - 1 else None)
+                elif i < len(parts) + len(evidence):
+                    item = evidence[i - len(parts)]
+                    if item['kind'] == 'text':
+                        self.telegram.send(admin, f"Результат задачи №{record['task']}:\n{item['text']}")
+                    else:
+                        kind = item['kind']
+                        self.telegram.call('sendDocument' if kind == 'document' else 'sendPhoto',
+                            {'chat_id': admin, kind: item['file_id'],
+                             'caption': f"Результат задачи №{record['task']}\n" + item.get('caption', '')[:350]})
+                else:
+                    self.telegram.send(admin, f"Решение по задаче №{record['task']}:", reply_markup=markup)
                 notices[str(admin)] = i + 1
-                with self.store.db:
-                    self.store.db.execute('UPDATE completions SET notices=? WHERE id=?',
-                        (json.dumps(notices), record['id']))
+                if remember:
+                    with self.store.db:
+                        self.store.db.execute('UPDATE completions SET notices=? WHERE id=?',
+                            (json.dumps(notices), record['id']))
 
-    def decide(self, uid, report_id, action):
+    def decide(self, uid, report_id, action, reason=''):
         if uid not in self.admins:
             raise ValueError('Решение может принять только администратор.')
         record = self.store.db.execute('SELECT * FROM completions WHERE id=?', (report_id,)).fetchone()
@@ -394,8 +447,8 @@ class CompletionFlow:
                 self.store.db.execute("UPDATE completions SET state='stale' WHERE id=?", (report_id,))
             raise ValueError('Задача или привязка изменена. Этот отчёт устарел; нужен новый отчёт.')
         with self.store.db:
-            self.store.db.execute('UPDATE completions SET state=? WHERE id=? AND state=\'pending\'',
-                ('approving' if action == 'approve' else 'returning', report_id))
+            self.store.db.execute('UPDATE completions SET state=?,reason=? WHERE id=? AND state=\'pending\'',
+                ('approving' if action == 'approve' else 'returning', reason, report_id))
         record = self.store.db.execute('SELECT * FROM completions WHERE id=?', (report_id,)).fetchone()
         try:
             self.finish(record)
@@ -427,6 +480,8 @@ class CompletionFlow:
         text = (f"✅ Администратор подтвердил выполнение задачи №{record['task']}. Статус: Выполнена."
                 if state == 'approved' else
                 f"↩️ Администратор вернул задачу №{record['task']}. Задача ещё не считается выполненной. После доработки сообщите о завершении повторно.")
+        if state == 'returned' and record['reason']:
+            text += '\n\nЧто исправить: ' + record['reason']
         self.telegram.send(record['chat'], text)
         with self.store.db:
             self.store.db.execute('UPDATE completions SET result_progress=1 WHERE id=?', (record['id'],))
@@ -547,6 +602,8 @@ class Engine:
                 markup = {'inline_keyboard': [[{
                     'text': f'✅ Сообщить о завершении задачи №{key}',
                     'callback_data': 'finish:' + hashlib.sha256(key.encode()).hexdigest()[:32]}]]}
+                markup['inline_keyboard'].insert(0, [{'text': '✅ Принять задачу',
+                    'callback_data': 'accept:' + hashlib.sha256(key.encode()).hexdigest()[:32]}])
                 message_id = self.telegram.send(destination, parts[i],
                     reply_markup=markup if i == len(parts) - 1 else None)
                 # Acknowledgement and progress are committed together.
@@ -574,6 +631,9 @@ class Engine:
 
 
 def handle_update(update, store, telegram, sheets, admins, username):
+    from workflow import Workflow
+    if Workflow(store, telegram, sheets, admins).handle(update):
+        return
     if update.get('callback_query'):
         handle_completion_callback(update['callback_query'], store, telegram, sheets, admins)
         return
@@ -683,8 +743,11 @@ def handle_update(update, store, telegram, sheets, admins, username):
         if binding:
             reply = f'Вы подключены как сотрудник {binding[0]}. Здесь приходят новые поручения.'
     parts = text_parts(reply)
+    from workflow import menu
+    if markup is not None and 'keyboard' in markup:
+        markup = menu(uid in admins)
     if uid not in admins and store.db.execute('SELECT 1 FROM bindings WHERE chat=?', (uid,)).fetchone():
-        markup = {'keyboard': [[{'text': FINISH_BUTTON}]], 'resize_keyboard': True, 'is_persistent': True}
+        markup = menu(False)
     for i, part in enumerate(parts):
         if i == len(parts) - 1 and markup is not None:
             telegram.send(uid, part, reply_markup=markup)
@@ -746,6 +809,8 @@ def main():
         return
     engine = Engine(store, telegram, sheets)
     completions = CompletionFlow(store, telegram, sheets, admins)
+    from workflow import Workflow
+    workflow = Workflow(store, telegram, sheets, admins)
     next_cycle = 0
     failures = 0
     try:
@@ -753,6 +818,7 @@ def main():
             if time.monotonic() >= next_cycle:
                 try:
                     engine.cycle()
+                    workflow.cycle()
                     completions.cycle()
                     failures = 0
                 except APIError as exc:
