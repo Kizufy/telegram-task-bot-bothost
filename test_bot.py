@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from bot import APIError, Engine, Sheets, Store, TASK_HEADERS, PEOPLE_HEADERS, Telegram, handle_update, message_parts
+from bot import APIError, Engine, Sheets, Store, TASK_HEADERS, PEOPLE_HEADERS, Telegram, handle_update, message_parts, CompletionFlow, FINISH_BUTTON
 
 
 def task(**changes):
@@ -25,6 +25,14 @@ class FakeSheets:
     def snapshot(self):
         return self.tasks, self.people
 
+    def complete(self, row, key, payload):
+        if self.fail_write:
+            raise RuntimeError('offline')
+        self.writes.append(('complete', row, key))
+        for index, value in self.tasks:
+            if index == row:
+                value['Статус задачи'] = 'Выполнена'
+
     def mirror(self, *args):
         if self.fail_write:
             raise RuntimeError('offline')
@@ -36,6 +44,11 @@ class FakeTelegram:
         self.messages = []
         self.errors = []
         self.markups = []
+        self.calls = []
+
+    def call(self, method, payload=None):
+        self.calls.append((method, payload))
+        return True
 
     def send(self, chat, text, reply_markup=None):
         if self.errors:
@@ -48,6 +61,139 @@ class FakeTelegram:
 
 
 class BotTests(unittest.TestCase):
+    def completion(self):
+        return CompletionFlow(self.store, self.tg, self.sheets, {10})
+
+    def report_id(self):
+        return self.store.db.execute('SELECT id FROM completions ORDER BY rowid DESC LIMIT 1').fetchone()[0]
+
+    def callback(self, action, uid=10, report=None):
+        handle_update({'callback_query': {'id': 'cb', 'from': {'id': uid},
+            'message': {'chat': {'id': uid, 'type': 'private'}, 'message_id': 1},
+            'data': action + ':' + (report or self.report_id())}},
+            self.store, self.tg, self.sheets, {10}, 'test_bot')
+
+    def test_report_button_prompt_and_admin_notification(self):
+        self.bind(chat=20)
+        self.menu_update('/start', uid=20)
+        self.assertIn(FINISH_BUTTON, str(self.tg.markups[-1]))
+        self.menu_update(FINISH_BUTTON, uid=20)
+        self.menu_update('1', uid=20)
+        notices = [(chat, text) for chat, text in self.tg.messages if chat == 10]
+        self.assertIn('Иванов Сергей', notices[0][1])
+        self.assertIn('Подготовить договор', notices[0][1])
+        self.assertIn('approve:', str(self.tg.markups))
+        self.assertEqual(self.sheets.tasks[0][1]['Статус задачи'], 'Новая')
+
+    def test_approval_changes_only_after_admin_and_is_idempotent(self):
+        self.bind(chat=20)
+        self.completion().report(20, '1')
+        self.callback('approve', uid=20)
+        self.assertEqual(self.sheets.tasks[0][1]['Статус задачи'], 'Новая')
+        self.callback('approve')
+        self.assertEqual(self.sheets.tasks[0][1]['Статус задачи'], 'Выполнена')
+        count = len(self.tg.messages)
+        self.callback('return')
+        self.completion().cycle()
+        self.assertEqual(len(self.tg.messages), count)
+        self.assertEqual(len(self.sheets.writes), 1)
+
+    def test_return_notifies_and_allows_new_report_old_buttons_do_not_affect_it(self):
+        self.bind(chat=20)
+        self.completion().report(20, '1')
+        old = self.report_id()
+        self.callback('return')
+        self.assertIn('не считается выполненной', self.tg.messages[-1][1])
+        self.assertEqual(self.sheets.tasks[0][1]['Статус задачи'], 'Новая')
+        self.completion().report(20, '1')
+        self.assertNotEqual(old, self.report_id())
+        self.callback('approve', report=old)
+        self.assertEqual(self.sheets.tasks[0][1]['Статус задачи'], 'Новая')
+
+    def test_reports_restrict_owner_inactive_duplicates_and_closed_tasks(self):
+        self.bind(chat=20)
+        for uid, key in [(99, '1'), (20, 'missing')]:
+            with self.assertRaises(ValueError):
+                self.completion().report(uid, key)
+        self.sheets.tasks[0][1]['ID сотрудника'] = 'EMP002'
+        with self.assertRaises(ValueError):
+            self.completion().report(20, '1')
+        self.sheets.tasks[0][1]['ID сотрудника'] = 'EMP001'
+        for status in ('Выполнена', 'Отменена'):
+            self.sheets.tasks[0][1]['Статус задачи'] = status
+            with self.assertRaises(ValueError):
+                self.completion().report(20, '1')
+        self.sheets.tasks[0][1]['Статус задачи'] = 'Новая'
+        self.completion().report(20, '1')
+        count = len(self.tg.messages)
+        self.completion().report(20, '1')
+        self.assertEqual(len(self.tg.messages), count)
+
+    def test_approval_survives_write_failure_and_restart_sorted_rows(self):
+        self.bind(chat=20)
+        self.completion().report(20, '1')
+        self.sheets.fail_write = True
+        self.callback('approve')
+        self.assertEqual(self.sheets.tasks[0][1]['Статус задачи'], 'Новая')
+        self.store.db.close()
+        self.store = Store(self.path)
+        self.sheets.fail_write = False
+        self.sheets.tasks = [(9, self.sheets.tasks[0][1])]
+        self.completion().cycle()
+        self.assertEqual(self.sheets.writes[0], ('complete', 9, '1'))
+        self.assertIn('подтвердил', self.tg.messages[-1][1])
+
+    def test_changed_task_invalidates_report(self):
+        self.bind(chat=20)
+        self.completion().report(20, '1')
+        self.sheets.tasks[0][1]['Задача'] = 'Другое поручение'
+        self.callback('approve')
+        self.assertEqual(self.sheets.writes, [])
+        self.assertEqual(self.store.db.execute('SELECT state FROM completions').fetchone()[0], 'stale')
+
+    def test_finish_button_on_notification_resolves_task_and_checks_owner(self):
+        self.bind(chat=20)
+        self.engine.cycle()
+        button = self.tg.markups[-1]['inline_keyboard'][0][0]
+        self.assertIn('№1', button['text'])
+        for uid in (99, 20):
+            handle_update({'callback_query': {'id': 'finish', 'from': {'id': uid},
+                'message': {'chat': {'id': uid, 'type': 'private'}}, 'data': button['callback_data']}},
+                self.store, self.tg, self.sheets, {10}, 'test_bot')
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM completions').fetchone()[0], 1)
+
+    def test_inactive_employee_cannot_report_and_duplicate_task_is_rejected(self):
+        self.bind(chat=20)
+        self.sheets.people['EMP001']['Активен'] = 'Нет'
+        with self.assertRaises(ValueError):
+            self.completion().report(20, '1')
+        self.sheets.people['EMP001']['Активен'] = 'Да'
+        self.sheets.tasks.append((3, task()))
+        with self.assertRaises(ValueError):
+            self.completion().report(20, '1')
+
+    def test_result_notification_retries_without_rewriting_sheet(self):
+        self.bind(chat=20)
+        self.completion().report(20, '1')
+        self.tg.errors = [APIError('retry', 'rate')]
+        self.callback('approve')
+        self.completion().cycle()
+        self.assertEqual(len(self.sheets.writes), 1)
+        self.assertIn('подтвердил', self.tg.messages[-1][1])
+
+    def test_completion_sheet_checks_identity_and_writes_only_status(self):
+        sheets = Sheets.__new__(Sheets)
+        sheets.task_sheet = 'Задачи'
+        responses = [{'values': [list(task().values())[:7]]}, {}, {'values': [['Выполнена']]}]
+        with patch.object(sheets, 'request', side_effect=responses) as request:
+            sheets.complete(2, '1', {'employee': 'EMP001', 'name': 'Иванов Сергей', 'text': 'Подготовить договор'})
+            body = request.call_args_list[1].kwargs['json']
+            self.assertEqual(body['data'], [{'range': "'Задачи'!F2", 'values': [['Выполнена']]}])
+        with patch.object(sheets, 'request', return_value={'values': [list(task(**{'Номер задачи': '2'}).values())[:7]]}) as request:
+            with self.assertRaises(ValueError):
+                sheets.complete(2, '1', {'employee': 'EMP001', 'name': 'Иванов Сергей', 'text': 'Подготовить договор'})
+            self.assertEqual(request.call_count, 1)
+
     def menu_update(self, text, uid=10):
         handle_update({'message': {'chat': {'id': uid, 'type': 'private'},
                        'from': {'id': uid}, 'text': text}}, self.store, self.tg,

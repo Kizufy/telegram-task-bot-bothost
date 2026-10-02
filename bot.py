@@ -153,6 +153,19 @@ class Sheets:
             {'range': self.address(self.task_sheet, f'I{row}:K{row}'),
              'values': [[status, timestamp, error]]}]})
 
+    def complete(self, row, task_id, payload):
+        address = self.address(self.task_sheet, f'A{row}:G{row}')
+        values = self.request('GET', '/values/' + urllib.parse.quote(address, safe='')).get('values', [])
+        found = dict(zip(TASK_HEADERS, values[0])) if values else {}
+        if not same_task(found, task_id, payload) or found.get('Статус задачи') == 'Отменена':
+            raise ValueError('Задача изменена или перемещена. Проверьте таблицу и отправьте новый отчёт.')
+        self.request('POST', '/values:batchUpdate', json={'valueInputOption': 'RAW', 'data': [
+            {'range': self.address(self.task_sheet, f'F{row}'), 'values': [['Выполнена']]}]})
+        result = self.request('GET', '/values/' + urllib.parse.quote(
+            self.address(self.task_sheet, f'F{row}'), safe='')).get('values', [])
+        if result != [['Выполнена']]:
+            raise RuntimeError('Не удалось подтвердить запись статуса в таблицу')
+
 
 class Store:
     def __init__(self, path):
@@ -169,6 +182,10 @@ class Store:
             retry_at REAL NOT NULL DEFAULT 0, sent_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
             mirror TEXT NOT NULL DEFAULT '');
           CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS completions(id TEXT PRIMARY KEY, task TEXT NOT NULL,
+            employee TEXT NOT NULL, chat INTEGER NOT NULL, payload TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending', notices TEXT NOT NULL DEFAULT '{}',
+            result_progress INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS message_log(task TEXT NOT NULL, part INTEGER NOT NULL,
             chat INTEGER NOT NULL, message_id INTEGER NOT NULL, sent_at TEXT NOT NULL,
             PRIMARY KEY(task,part));
@@ -279,6 +296,177 @@ def message_parts(task, payload):
     return parts
 
 
+FINISH_BUTTON = '✅ Сообщить о завершении задачи'
+
+
+def task_payload(task):
+    return {'employee': str(task['ID сотрудника']).strip(),
+            'name': str(task['ФИО']).strip(), 'text': str(task['Задача']).strip()}
+
+
+def same_task(task, key, payload):
+    return (str(task.get('Номер задачи', '')).strip() == key and
+            all(str(task.get(column, '')).strip() == payload[field]
+                for column, field in [('ID сотрудника', 'employee'), ('ФИО', 'name'), ('Задача', 'text')]))
+
+
+def find_task(tasks, key):
+    matches = [(row, task) for row, task in tasks if str(task['Номер задачи']).strip() == key]
+    if len(matches) != 1:
+        raise ValueError('Задача не найдена или её номер повторяется в таблице.')
+    return matches[0]
+
+
+class CompletionFlow:
+    def __init__(self, store, telegram, sheets, admins):
+        self.store, self.telegram, self.sheets, self.admins = store, telegram, sheets, admins
+
+    def report(self, uid, key):
+        binding = self.store.db.execute('SELECT employee FROM bindings WHERE chat=?', (uid,)).fetchone()
+        if not binding:
+            raise ValueError('Сначала подключитесь по приглашению администратора.')
+        tasks, people = self.sheets.snapshot()
+        _, task = find_task(tasks, key)
+        payload = task_payload(task)
+        person = people.get(binding[0])
+        if (payload['employee'] != binding[0] or not person or not yes(person['Активен'])
+                or payload['name'] != str(person['ФИО']).strip()):
+            raise ValueError('Можно сообщать о завершении только своих активных задач.')
+        if task['Статус задачи'] in ('Выполнена', 'Отменена'):
+            raise ValueError('Эта задача уже выполнена или отменена.')
+        if not self.admins:
+            raise ValueError('Администратор не настроен. Отчёт не отправлен.')
+        existing = self.store.db.execute(
+            "SELECT id FROM completions WHERE task=? AND state IN ('pending','approving','returning')", (key,)).fetchone()
+        if existing:
+            return 'Отчёт по этой задаче уже ожидает решения администратора.'
+        with self.store.db:
+            self.store.db.execute('INSERT INTO completions(id,task,employee,chat,payload) VALUES(?,?,?,?,?)',
+                (secrets.token_hex(12), key, binding[0], uid, json.dumps(payload, ensure_ascii=False)))
+        self.cycle()
+        return f'Отчёт по задаче №{key} сохранён и поставлен на отправку администратору.'
+
+    def cycle(self):
+        for record in self.store.db.execute("SELECT * FROM completions WHERE state IN ('pending','approving','returning','approved','returned')").fetchall():
+            try:
+                if record['state'] == 'pending':
+                    self.notify_admins(record)
+                else:
+                    self.finish(record)
+            except APIError as exc:
+                if exc.kind == 'fatal':
+                    raise
+                LOG.warning('Уведомление о завершении не доставлено; повтор позже')
+            except Exception:
+                LOG.warning('Завершение задачи не синхронизировано; повтор позже')
+
+    def notify_admins(self, record):
+        payload = json.loads(record['payload'])
+        parts = text_parts(f"Сотрудник {payload['name']} сообщил о выполнении задачи №{record['task']}.\n\nЗадача: {payload['text']}")
+        notices = json.loads(record['notices'])
+        markup = {'inline_keyboard': [
+            [{'text': '✅ Подтвердить выполнение задачи', 'callback_data': 'approve:' + record['id']}],
+            [{'text': '↩️ Вернуть задачу', 'callback_data': 'return:' + record['id']}]]}
+        for admin in sorted(self.admins):
+            progress = notices.get(str(admin), 0)
+            for i in range(progress, len(parts)):
+                self.telegram.send(admin, parts[i], reply_markup=markup if i == len(parts) - 1 else None)
+                notices[str(admin)] = i + 1
+                with self.store.db:
+                    self.store.db.execute('UPDATE completions SET notices=? WHERE id=?',
+                        (json.dumps(notices), record['id']))
+
+    def decide(self, uid, report_id, action):
+        if uid not in self.admins:
+            raise ValueError('Решение может принять только администратор.')
+        record = self.store.db.execute('SELECT * FROM completions WHERE id=?', (report_id,)).fetchone()
+        if not record:
+            raise ValueError('Отчёт не найден.')
+        if record['state'] != 'pending':
+            return 'Решение по этому отчёту уже принято.'
+        tasks, people = self.sheets.snapshot()
+        _, task = find_task(tasks, record['task'])
+        payload = json.loads(record['payload'])
+        if (not same_task(task, record['task'], payload)
+                or self.store.chat(record['employee']) != record['chat']
+                or task['Статус задачи'] in ('Выполнена', 'Отменена')):
+            with self.store.db:
+                self.store.db.execute("UPDATE completions SET state='stale' WHERE id=?", (report_id,))
+            raise ValueError('Задача или привязка изменена. Этот отчёт устарел; нужен новый отчёт.')
+        with self.store.db:
+            self.store.db.execute('UPDATE completions SET state=? WHERE id=? AND state=\'pending\'',
+                ('approving' if action == 'approve' else 'returning', report_id))
+        record = self.store.db.execute('SELECT * FROM completions WHERE id=?', (report_id,)).fetchone()
+        try:
+            self.finish(record)
+        except (RuntimeError, APIError):
+            return 'Решение сохранено. Синхронизация и уведомление будут повторены автоматически.'
+        return 'Выполнение подтверждено.' if action == 'approve' else 'Задача возвращена сотруднику.'
+
+    def finish(self, record):
+        state = record['state']
+        if state in ('approving', 'returning'):
+            tasks, _ = self.sheets.snapshot()
+            row, task = find_task(tasks, record['task'])
+            if (not same_task(task, record['task'], json.loads(record['payload']))
+                    or self.store.chat(record['employee']) != record['chat']
+                    or task['Статус задачи'] == 'Отменена'
+                    or (state == 'returning' and task['Статус задачи'] == 'Выполнена')):
+                with self.store.db:
+                    self.store.db.execute("UPDATE completions SET state='stale' WHERE id=?", (record['id'],))
+                raise ValueError('Задача изменена; решение не применено.')
+            if state == 'approving':
+                self.sheets.complete(row, record['task'], json.loads(record['payload']))
+            state = 'approved' if state == 'approving' else 'returned'
+            with self.store.db:
+                self.store.db.execute('UPDATE completions SET state=? WHERE id=?', (state, record['id']))
+        if record['result_progress']:
+            return
+        if self.store.chat(record['employee']) != record['chat']:
+            return
+        text = (f"✅ Администратор подтвердил выполнение задачи №{record['task']}. Статус: Выполнена."
+                if state == 'approved' else
+                f"↩️ Администратор вернул задачу №{record['task']}. Задача ещё не считается выполненной. После доработки сообщите о завершении повторно.")
+        self.telegram.send(record['chat'], text)
+        with self.store.db:
+            self.store.db.execute('UPDATE completions SET result_progress=1 WHERE id=?', (record['id'],))
+
+
+def handle_completion_callback(callback, store, telegram, sheets, admins):
+    uid = callback.get('from', {}).get('id')
+    message = callback.get('message', {})
+    chat = message.get('chat', {})
+    data = callback.get('data', '')
+    action, _, report_id = data.partition(':')
+    if action == 'finish':
+        reply = 'Откройте бота в личном чате.'
+        if chat.get('type') == 'private' and chat.get('id') == uid:
+            try:
+                tasks, _ = sheets.snapshot()
+                keys = [str(task['Номер задачи']).strip() for _, task in tasks
+                        if hashlib.sha256(str(task['Номер задачи']).strip().encode()).hexdigest()[:32] == report_id]
+                if len(keys) != 1:
+                    raise ValueError('Задача не найдена или её номер повторяется.')
+                reply = CompletionFlow(store, telegram, sheets, admins).report(uid, keys[0])
+            except ValueError as exc:
+                reply = str(exc)
+            except RuntimeError:
+                reply = 'Таблица недоступна. Попробуйте позже.'
+        telegram.call('answerCallbackQuery', {'callback_query_id': callback['id'], 'text': reply[:200], 'show_alert': True})
+        return
+    if action not in ('approve', 'return'):
+        return
+    reply = 'Решение может принять только администратор в личном чате.'
+    if uid in admins and chat.get('type') == 'private' and chat.get('id') == uid:
+        try:
+            reply = CompletionFlow(store, telegram, sheets, admins).decide(uid, report_id, action)
+        except ValueError as exc:
+            reply = str(exc)
+        except RuntimeError:
+            reply = 'Таблица недоступна. Попробуйте нажать кнопку позже.'
+    telegram.call('answerCallbackQuery', {'callback_query_id': callback['id'], 'text': reply[:200], 'show_alert': True})
+
+
 class Engine:
     def __init__(self, store, telegram, sheets):
         self.store, self.telegram, self.sheets = store, telegram, sheets
@@ -356,7 +544,11 @@ class Engine:
         self.store.set(key, state='sending', attempts=attempts)
         try:
             for i in range(progress, len(parts)):
-                message_id = self.telegram.send(destination, parts[i])
+                markup = {'inline_keyboard': [[{
+                    'text': f'✅ Сообщить о завершении задачи №{key}',
+                    'callback_data': 'finish:' + hashlib.sha256(key.encode()).hexdigest()[:32]}]]}
+                message_id = self.telegram.send(destination, parts[i],
+                    reply_markup=markup if i == len(parts) - 1 else None)
                 # Acknowledgement and progress are committed together.
                 with self.store.db:
                     self.store.db.execute('INSERT OR REPLACE INTO message_log VALUES(?,?,?,?,?)',
@@ -382,6 +574,9 @@ class Engine:
 
 
 def handle_update(update, store, telegram, sheets, admins, username):
+    if update.get('callback_query'):
+        handle_completion_callback(update['callback_query'], store, telegram, sheets, admins)
+        return
     message = update.get('message', {})
     chat = message.get('chat', {})
     if chat.get('type') != 'private' or not message.get('text'):
@@ -395,13 +590,35 @@ def handle_update(update, store, telegram, sheets, admins, username):
     fields = text.split(maxsplit=1)
     command = fields[0].split('@')[0]
     argument = fields[1].strip() if len(fields) > 1 else ''
+    if text == FINISH_BUTTON:
+        with store.db:
+            store.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)', (f'finish:{uid}', '1'))
+        telegram.send(uid, 'Введите номер завершённой задачи. Например: 12. Для отмены — /cancel.')
+        return
+    waiting = store.db.execute('SELECT value FROM settings WHERE key=?', (f'finish:{uid}',)).fetchone()
+    if command == '/done' or (waiting and not text.startswith('/')):
+        key = argument if command == '/done' else text
+        try:
+            reply = CompletionFlow(store, telegram, sheets, admins).report(uid, key)
+            with store.db:
+                store.db.execute('DELETE FROM settings WHERE key=?', (f'finish:{uid}',))
+        except ValueError as exc:
+            reply = str(exc)
+        telegram.send(uid, reply)
+        return
+    if waiting and text.startswith('/'):
+        with store.db:
+            store.db.execute('DELETE FROM settings WHERE key=?', (f'finish:{uid}',))
+        if command == '/cancel':
+            telegram.send(uid, 'Ввод номера отменён.')
+            return
     if text == '📊 Открыть таблицу':
         command, argument = '/table', ''
     elif text == '👥 Сотрудники':
         command, argument = '/employees', ''
     markup = None
     if uid in admins:
-        markup = {'keyboard': [[{'text': '📊 Открыть таблицу'}, {'text': '👥 Сотрудники'}]],
+        markup = {'keyboard': [[{'text': '📊 Открыть таблицу'}, {'text': '👥 Сотрудники'}], [{'text': FINISH_BUTTON}]],
                   'resize_keyboard': True, 'is_persistent': True}
     reply = 'Для подключения нужна персональная ссылка от администратора.'
     if command == '/id':
@@ -466,6 +683,8 @@ def handle_update(update, store, telegram, sheets, admins, username):
         if binding:
             reply = f'Вы подключены как сотрудник {binding[0]}. Здесь приходят новые поручения.'
     parts = text_parts(reply)
+    if uid not in admins and store.db.execute('SELECT 1 FROM bindings WHERE chat=?', (uid,)).fetchone():
+        markup = {'keyboard': [[{'text': FINISH_BUTTON}]], 'resize_keyboard': True, 'is_persistent': True}
     for i, part in enumerate(parts):
         if i == len(parts) - 1 and markup is not None:
             telegram.send(uid, part, reply_markup=markup)
@@ -526,6 +745,7 @@ def main():
     if args.command == 'check':
         return
     engine = Engine(store, telegram, sheets)
+    completions = CompletionFlow(store, telegram, sheets, admins)
     next_cycle = 0
     failures = 0
     try:
@@ -533,6 +753,7 @@ def main():
             if time.monotonic() >= next_cycle:
                 try:
                     engine.cycle()
+                    completions.cycle()
                     failures = 0
                 except APIError as exc:
                     if exc.kind == 'fatal':
@@ -544,7 +765,7 @@ def main():
                     LOG.error('Таблица недоступна или некорректна; отправка приостановлена')
                 next_cycle = time.monotonic() + min(3600, interval * 2 ** min(failures, 5))
             try:
-                updates = telegram.call('getUpdates', {'offset': store.offset(), 'timeout': 15, 'limit': 20, 'allowed_updates': ['message']})
+                updates = telegram.call('getUpdates', {'offset': store.offset(), 'timeout': 15, 'limit': 20, 'allowed_updates': ['message', 'callback_query']})
                 for update in updates:
                     try:
                         handle_update(update, store, telegram, sheets, admins, identity['username'])
