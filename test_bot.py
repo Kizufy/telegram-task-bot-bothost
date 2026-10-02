@@ -35,17 +35,52 @@ class FakeTelegram:
     def __init__(self):
         self.messages = []
         self.errors = []
+        self.markups = []
 
-    def send(self, chat, text):
+    def send(self, chat, text, reply_markup=None):
         if self.errors:
             error = self.errors.pop(0)
             if error:
                 raise error
         self.messages.append((chat, text))
+        self.markups.append(reply_markup)
         return len(self.messages)
 
 
 class BotTests(unittest.TestCase):
+    def menu_update(self, text, uid=10):
+        handle_update({'message': {'chat': {'id': uid, 'type': 'private'},
+                       'from': {'id': uid}, 'text': text}}, self.store, self.tg,
+                      self.sheets, {10}, 'test_bot')
+
+    def test_admin_menu_and_sheet_button(self):
+        self.menu_update('/start')
+        self.assertIn('👥 Сотрудники', str(self.tg.markups[-1]))
+        with patch.dict('os.environ', {'GOOGLE_SPREADSHEET_ID': 'example-sheet'}):
+            self.menu_update('📊 Открыть таблицу')
+        self.assertEqual(self.tg.markups[-1]['inline_keyboard'][0][0]['url'],
+                         'https://docs.google.com/spreadsheets/d/example-sheet/edit')
+
+    def test_employee_list_admin_only(self):
+        for text in ('/employees', '👥 Сотрудники', '/table', '📊 Открыть таблицу'):
+            with patch.object(self.sheets, 'snapshot', side_effect=AssertionError('Unauthorized read')):
+                self.menu_update(text, uid=20)
+            self.assertNotIn('Иванов', self.tg.messages[-1][1])
+            self.assertIsNone(self.tg.markups[-1])
+        self.menu_update('👥 Сотрудники')
+        self.assertIn('Иванов Сергей — ID сотрудника: EMP001', self.tg.messages[-1][1])
+
+    def test_large_and_empty_employee_list(self):
+        self.sheets.people = {}
+        self.menu_update('/employees')
+        self.assertIn('пока пуст', self.tg.messages[-1][1])
+        self.sheets.people = {f'EMP{i:04}': {'ФИО': '😀' * 50 + str(i), 'Активен': 'Нет'} for i in range(100)}
+        self.tg.messages.clear()
+        self.menu_update('/employees')
+        self.assertGreater(len(self.tg.messages), 1)
+        self.assertTrue(all(len(text.encode('utf-16-le')) // 2 <= 3500 for _, text in self.tg.messages))
+        self.assertIn('EMP0099', ''.join(text for _, text in self.tg.messages))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = str(Path(self.tmp.name) / 'db.sqlite3')

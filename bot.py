@@ -72,8 +72,11 @@ class Telegram:
             raise APIError('permanent', 'Telegram отклонил сообщение: чат недоступен или запрос некорректен')
         raise APIError('uncertain', 'Неопределённый результат Telegram')
 
-    def send(self, chat_id, text):
-        return self.call('sendMessage', {'chat_id': chat_id, 'text': text})['message_id']
+    def send(self, chat_id, text, reply_markup=None):
+        payload = {'chat_id': chat_id, 'text': text}
+        if reply_markup is not None:
+            payload['reply_markup'] = reply_markup
+        return self.call('sendMessage', payload)['message_id']
 
 
 def col(index):
@@ -250,11 +253,7 @@ def yes(value):
     return str(value).strip().casefold() == 'да'
 
 
-def message_parts(task, payload):
-    text = (f"Новая задача №{task}\n\nЗадача: {payload['text']}\n"
-            f"Исполнитель: {payload['name']}\nДедлайн: {payload['due'] or 'Срок не указан'}")
-    if payload['due']:
-        text += ' (МСК)'
+def text_parts(text):
     # Conservative UTF-16 unit bound, including continuation label.
     parts, chunk, units = [], [], 0
     for char in text:
@@ -266,6 +265,15 @@ def message_parts(task, payload):
         units += size
     if chunk:
         parts.append(''.join(chunk))
+    return parts
+
+
+def message_parts(task, payload):
+    text = (f"Новая задача №{task}\n\nЗадача: {payload['text']}\n"
+            f"Исполнитель: {payload['name']}\nДедлайн: {payload['due'] or 'Срок не указан'}")
+    if payload['due']:
+        text += ' (МСК)'
+    parts = text_parts(text)
     if len(parts) > 1:
         parts = [f'Задача №{task}, часть {i}/{len(parts)}\n\n{part}' for i, part in enumerate(parts, 1)]
     return parts
@@ -381,9 +389,20 @@ def handle_update(update, store, telegram, sheets, admins, username):
     uid = message.get('from', {}).get('id')
     if uid != chat.get('id'):
         return
-    fields = message['text'].strip().split(maxsplit=1)
+    text = message['text'].strip()
+    if not text:
+        return
+    fields = text.split(maxsplit=1)
     command = fields[0].split('@')[0]
     argument = fields[1].strip() if len(fields) > 1 else ''
+    if text == '📊 Открыть таблицу':
+        command, argument = '/table', ''
+    elif text == '👥 Сотрудники':
+        command, argument = '/employees', ''
+    markup = None
+    if uid in admins:
+        markup = {'keyboard': [[{'text': '📊 Открыть таблицу'}, {'text': '👥 Сотрудники'}]],
+                  'resize_keyboard': True, 'is_persistent': True}
     reply = 'Для подключения нужна персональная ссылка от администратора.'
     if command == '/id':
         reply = f'Ваш Telegram ID: {uid}'
@@ -400,7 +419,22 @@ def handle_update(update, store, telegram, sheets, admins, username):
         else:
             reply = 'Приглашение недействительно или сотрудник неактивен.'
     elif uid in admins:
-        if command == '/invite' and argument:
+        if command == '/table':
+            spreadsheet_id = os.getenv('GOOGLE_SPREADSHEET_ID', '').strip()
+            if spreadsheet_id:
+                reply = 'Открыть общую таблицу поручений:'
+                markup = {'inline_keyboard': [[{'text': '📊 Открыть таблицу',
+                           'url': f'https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit'}]]}
+            else:
+                reply = 'ID таблицы не настроен. Проверьте GOOGLE_SPREADSHEET_ID.'
+        elif command == '/employees':
+            _, people = sheets.snapshot()
+            rows = [f"{person['ФИО']} — ID сотрудника: {employee}" +
+                    ('' if yes(person['Активен']) else ' (неактивен)')
+                    for employee, person in sorted(people.items(),
+                        key=lambda item: (str(item[1]['ФИО']).casefold(), item[0]))]
+            reply = f'Сотрудники: {len(rows)}\n\n' + '\n'.join(rows) if rows else 'Список сотрудников пока пуст. Добавьте сотрудников на лист «Сотрудники».'
+        elif command == '/invite' and argument:
             _, people = sheets.snapshot()
             if argument in people and yes(people[argument]['Активен']):
                 code = store.invite(argument)
@@ -426,12 +460,17 @@ def handle_update(update, store, telegram, sheets, admins, username):
             store.unbind(argument)
             reply = 'Привязка и приглашения удалены. Для подключения создайте новую ссылку.'
         else:
-            reply = '/invite ID — приглашение\n/errors — ошибки\n/retry НОМЕР — повтор после проверки\n/sent НОМЕР — подтвердить неопределённую отправку\n/unbind ID — отвязать\n/id — ваш ID'
+            reply = 'Меню администратора\n\n/table — открыть таблицу\n/employees — ФИО и ID сотрудников\n/invite ID — приглашение\n/errors — ошибки\n/retry НОМЕР — повтор после проверки\n/sent НОМЕР — подтвердить неопределённую отправку\n/unbind ID — отвязать\n/id — ваш ID'
     else:
         binding = store.db.execute('SELECT employee FROM bindings WHERE chat=?', (uid,)).fetchone()
         if binding:
             reply = f'Вы подключены как сотрудник {binding[0]}. Здесь приходят новые поручения.'
-    telegram.send(uid, reply)
+    parts = text_parts(reply)
+    for i, part in enumerate(parts):
+        if i == len(parts) - 1 and markup is not None:
+            telegram.send(uid, part, reply_markup=markup)
+        else:
+            telegram.send(uid, part)
 
 
 def main():
