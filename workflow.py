@@ -282,7 +282,9 @@ class Workflow:
             if uid in self.admins:
                 rows.append([button('✏️ Изменить поручение', 'edit:' + digest)])
             if self.store.chat(str(task['ID сотрудника']).strip()) == uid:
-                rows += [[button('✅ Принять задачу', 'accept:' + digest)], [button('✅ Сообщить о завершении', 'finish:' + digest)], [button('📅 Запросить перенос', 'move:' + digest)]]
+                if not accepted or accepted[0] != revision(task):
+                    rows.append([button('✅ Принять задачу', 'accept:' + digest)])
+                rows += [[button('✅ Сообщить о завершении', 'finish:' + digest)], [button('📅 Запросить перенос', 'move:' + digest)]]
         if pending:
             text += '\nОтчёт ожидает проверки администратора.'
             if uid in self.admins and pending['state'] == 'pending':
@@ -546,7 +548,7 @@ class Workflow:
             return bool(callback)
         try:
             if callback:
-                handled = self.callback(uid, callback.get('data', ''))
+                handled = self.callback(uid, callback.get('data', ''), message)
                 if handled:
                     self.tg.call('answerCallbackQuery', {'callback_query_id': callback['id']})
                 return handled
@@ -593,7 +595,7 @@ class Workflow:
             self.tg.call('answerCallbackQuery', {'callback_query_id': callback['id']})
         return True
 
-    def callback(self, uid, data):
+    def callback(self, uid, data, message=None):
         fields = data.split(':')
         action = fields[0]
         if action == 'approve':
@@ -627,7 +629,20 @@ class Workflow:
             self.clear(uid)
             self.begin_report(uid, key) if action == 'finish' else self.begin_move(uid, key)
         elif action == 'accept':
-            self.send(uid, self.accept(uid, fields[1]))
+            reply = self.accept(uid, fields[1])
+            if message and message.get('message_id'):
+                original = message.get('reply_markup', {}).get('inline_keyboard', [])
+                rows = [[b for b in row if b.get('callback_data') != data] for row in original]
+                rows = [row for row in rows if row]
+                if rows != original:
+                    try:
+                        self.tg.call('editMessageReplyMarkup', {
+                            'chat_id': uid, 'message_id': message['message_id'],
+                            'reply_markup': keyboard(rows),
+                        })
+                    except APIError:
+                        LOG.warning('Не удалось скрыть кнопку принятия; задача принята, повторное нажатие обновит кнопки')
+            self.send(uid, reply)
         elif action == 'cancel':
             self.clear(uid)
             self.send(uid, 'Действие отменено.', menu(uid in self.admins))

@@ -103,6 +103,32 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(notices), 1)
         self.click('card:' + token('1'))
         self.assertIn('Принята сотрудником: Да', self.tg.messages[-1][1])
+        self.assertNotIn('accept:', str(self.tg.markups[-1]))
+
+    def test_acceptance_removes_only_clicked_task_button_from_original_message(self):
+        data = 'accept:' + token('1')
+        remaining = [{'text': 'Завершить', 'callback_data': 'finish:' + token('1')},
+                     {'text': 'Другая задача', 'callback_data': 'accept:' + token('2')}]
+        update = {'callback_query': {'id': 'accept-query', 'from': {'id': 20}, 'data': data,
+            'message': {'message_id': 123, 'chat': {'id': 20, 'type': 'private'},
+                'reply_markup': {'inline_keyboard': [[{'text': 'Принять', 'callback_data': data}], remaining]}}}}
+        handle_update(update, self.store, self.tg, self.sheets, {10}, 'test_bot')
+        edits = [payload for method, payload in self.tg.calls if method == 'editMessageReplyMarkup']
+        self.assertEqual(edits, [{'chat_id': 20, 'message_id': 123,
+                                'reply_markup': {'inline_keyboard': [remaining]}}])
+        self.click('card:' + token('1'))
+        self.assertNotIn(data, str(self.tg.markups[-1]))
+        self.sheets.tasks[0][1]['Задача'] = 'Новое содержание'
+        self.click('card:' + token('1'))
+        self.assertIn(data, str(self.tg.markups[-1]))
+
+    def test_unauthorized_acceptance_does_not_edit_message_buttons(self):
+        handle_update({'callback_query': {'id': 'foreign', 'from': {'id': 99},
+            'data': 'accept:' + token('1'), 'message': {'message_id': 123,
+                'chat': {'id': 99, 'type': 'private'}, 'reply_markup': {'inline_keyboard': [
+                    [{'text': 'Принять', 'callback_data': 'accept:' + token('1')}]]}}}},
+            self.store, self.tg, self.sheets, {10}, 'test_bot')
+        self.assertFalse(any(method == 'editMessageReplyMarkup' for method, _ in self.tg.calls))
 
     def test_report_collects_photo_document_link_and_comment(self):
         self.click('finish:' + token('1'))
